@@ -70,15 +70,14 @@ func Swap(client *rpc.Client, network string, poolAddress string, inputTokenAddr
 		outputMint = poolState.CoinVaultMint
 		direction = PC2Coin
 	}
-	// TODO: add wsol ata
 	fmt.Println("inputMint:", inputMint)
 	fmt.Println("outputMint:", outputMint)
-	inputAta, _, err := solana.FindAssociatedTokenAddress(payerPubKey, inputMint)
+	inputAta, inputAtaCreateInstruction, err := getOrCreateTokenAccountInstruction(client, inputMint, signer)
 	if err != nil {
 		return "", fmt.Errorf("failed to find associated token address: %v", err)
 	}
 
-	outputAta, ataCreateInstruction, err := getOrCreateTokenAccountInstruction(client, outputMint, signer)
+	outputAta, outputAtaCreateInstruction, err := getOrCreateTokenAccountInstruction(client, outputMint, signer)
 	if err != nil {
 		return "", err
 	}
@@ -130,7 +129,7 @@ func Swap(client *rpc.Client, network string, poolAddress string, inputTokenAddr
 		return "", fmt.Errorf("failed to fetch recent blockhash: %w", err)
 	}
 	tx, err := solana.NewTransaction(
-		swapInstructionsFrom(computeUnitLimit, ataCreateInstruction, swapInstruction),
+		swapInstructionsFrom(computeUnitLimit, inputAtaCreateInstruction, outputAtaCreateInstruction, swapInstruction),
 		blockhash.Value.Blockhash,
 		solana.TransactionPayer(payerPubKey),
 	)
@@ -187,14 +186,22 @@ func baseOutDataFrom(maxAmountIn uint64, amountOut uint64) ([]byte, error) {
 	return data, nil
 }
 
-func swapInstructionsFrom(computeUnitLimit uint32, ataCreateInstruction *associatedtokenaccount.Instruction, swapInstruction *solana.GenericInstruction) []solana.Instruction {
+func swapInstructionsFrom(
+	computeUnitLimit uint32,
+	inputAtaCreateInstruction *associatedtokenaccount.Instruction,
+	outputAtaCreateInstruction *associatedtokenaccount.Instruction,
+	swapInstruction *solana.GenericInstruction,
+) []solana.Instruction {
 	computeUnitLimitInstruction := computebudget.NewSetComputeUnitLimitInstruction(
 		computeUnitLimit,
 	).Build()
 
 	instructions := []solana.Instruction{computeUnitLimitInstruction}
-	if ataCreateInstruction != nil {
-		instructions = append(instructions, ataCreateInstruction)
+	if inputAtaCreateInstruction != nil {
+		instructions = append(instructions, inputAtaCreateInstruction)
+	}
+	if outputAtaCreateInstruction != nil {
+		instructions = append(instructions, outputAtaCreateInstruction)
 	}
 	instructions = append(instructions, swapInstruction)
 	return instructions
