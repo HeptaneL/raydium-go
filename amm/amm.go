@@ -154,9 +154,9 @@ func Swap(client *rpc.Client, network string, poolAddress string, inputTokenAddr
 	} else {
 		var maxAmountIn uint64
 		if direction == Coin2PC {
-			maxAmountIn = uint64(float64(coinVaultAmount) * float64(amountSpecified) / float64(pcVaultAmount-amountSpecified) * float64(1-float64(poolState.Fees.MinSeparateDenominator)/float64(poolState.Fees.SwapFeeNumerator)) * float64(1+slippage))
+			maxAmountIn = uint64(float64(coinVaultAmount) * float64(amountSpecified) / float64(pcVaultAmount-amountSpecified) * float64(poolState.Fees.SwapFeeDenominator) / float64(poolState.Fees.SwapFeeDenominator-poolState.Fees.SwapFeeNumerator) * float64(1+slippage))
 		} else {
-			maxAmountIn = uint64(float64(pcVaultAmount) * float64(amountSpecified) / float64(coinVaultAmount-amountSpecified) * float64(1-float64(poolState.Fees.MinSeparateDenominator)/float64(poolState.Fees.SwapFeeNumerator)) * float64(1+slippage))
+			maxAmountIn = uint64(float64(pcVaultAmount) * float64(amountSpecified) / float64(coinVaultAmount-amountSpecified) * float64(poolState.Fees.SwapFeeDenominator) / float64(poolState.Fees.SwapFeeDenominator-poolState.Fees.SwapFeeNumerator) * float64(1+slippage))
 		}
 		data, err = baseOutDataFrom(maxAmountIn, amountSpecified)
 		if err != nil {
