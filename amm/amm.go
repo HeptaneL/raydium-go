@@ -3,6 +3,7 @@ package amm
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -14,14 +15,18 @@ import (
 	"github.com/gagliardetto/solana-go"
 	associatedtokenaccount "github.com/gagliardetto/solana-go/programs/associated-token-account"
 	computebudget "github.com/gagliardetto/solana-go/programs/compute-budget"
+	"github.com/gagliardetto/solana-go/programs/system"
+	"github.com/gagliardetto/solana-go/programs/token"
 	"github.com/gagliardetto/solana-go/rpc"
 )
 
 var (
-	computeUnitLimit                   = uint32(68000)
-	SYSTEM_TOKEN_PROGRAM               = solana.MustPublicKeyFromBase58("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA") // program id for token program
-	PC2Coin              SwapDirection = "pc2coin"
-	Coin2PC              SwapDirection = "coin2Pc"
+	computeUnitLimit               = uint32(68000)
+	priorityFee                    = uint64(100)
+	dataSize                       = uint64(165)
+	WSOL                           = solana.MustPublicKeyFromBase58("So11111111111111111111111111111111111111112")
+	PC2Coin          SwapDirection = "pc2coin"
+	Coin2PC          SwapDirection = "coin2Pc"
 )
 
 type SwapDirection string
@@ -39,6 +44,37 @@ type SwapInstructionBaseOut struct {
 	/// Minimum amount of DESTINATION token to output, prevents excessive slippage
 	AmountOut uint64
 }
+
+type SwapBaseInLog struct {
+	LogType    uint8
+	AmountIn   uint64
+	MinimumOut uint64
+	Direction  uint64
+	UserSource uint64
+	PoolCoin   uint64
+	PoolPc     uint64
+	OutAmount  uint64
+}
+
+type SwapBaseOutLog struct {
+	LogType    uint8
+	MaxIn      uint64
+	AmountOut  uint64
+	Direction  uint64
+	UserSource uint64
+	PoolCoin   uint64
+	PoolPc     uint64
+	DeductIn   uint64
+}
+
+// 枚举日志类型
+const (
+	LogInit        = 0
+	LogDeposit     = 1
+	LogWithdraw    = 2
+	LogSwapBaseIn  = 3
+	LogSwapBaseOut = 4
+)
 
 func Swap(client *rpc.Client, network string, poolAddress string, inputTokenAddress string, amountSpecified uint64, baseIn bool, slippage float64, privateKey string) (string, error) {
 	pool, err := solana.PublicKeyFromBase58(poolAddress)
@@ -72,14 +108,25 @@ func Swap(client *rpc.Client, network string, poolAddress string, inputTokenAddr
 	}
 	fmt.Println("inputMint:", inputMint)
 	fmt.Println("outputMint:", outputMint)
-	inputAta, inputAtaCreateInstruction, err := getOrCreateTokenAccountInstruction(client, inputMint, signer)
+	var instructions []solana.Instruction
+	inputAta, inputAtaCreateInstruction, err := getOrCreateTokenAccountInstruction(client, inputMint, signer, amountSpecified, true)
 	if err != nil {
 		return "", fmt.Errorf("failed to find associated token address: %v", err)
 	}
+	if inputAtaCreateInstruction != nil {
+		for _, inst := range inputAtaCreateInstruction {
+			instructions = append(instructions, inst)
+		}
+	}
 
-	outputAta, outputAtaCreateInstruction, err := getOrCreateTokenAccountInstruction(client, outputMint, signer)
+	outputAta, outputAtaCreateInstruction, err := getOrCreateTokenAccountInstruction(client, outputMint, signer, amountSpecified, false)
 	if err != nil {
 		return "", err
+	}
+	if outputAtaCreateInstruction != nil {
+		for _, inst := range outputAtaCreateInstruction {
+			instructions = append(instructions, inst)
+		}
 	}
 
 	ammAuthority, _, _ := solana.FindProgramAddress([][]byte{{97, 109, 109, 32, 97, 117, 116, 104, 111, 114, 105, 116, 121}}, config.Raydium_AMM_Program[network])
@@ -121,15 +168,42 @@ func Swap(client *rpc.Client, network string, poolAddress string, inputTokenAddr
 		swapAccountsFrom(pool, ammAuthority, poolState.OpenOrders, poolState.TargetOrders, poolState.CoinVault, poolState.PcVault, poolState.MarketProgram, poolState.Market, marketState.Bids, marketState.Asks, marketState.EventQueue, marketState.BaseVault, marketState.QuoteVault, vaultSigner, inputAta, outputAta, payerPubKey),
 		data,
 	)
+	instructions = append(instructions, swapInstruction)
 	for _, a := range swapInstruction.AccountValues {
 		fmt.Println(a.PublicKey.String())
 	}
+	if inputMint.Equals(WSOL) {
+		closeAccInst, err := token.NewCloseAccountInstruction(
+			inputAta,
+			signer.PublicKey(),
+			signer.PublicKey(),
+			[]solana.PublicKey{},
+		).ValidateAndBuild()
+
+		if err != nil {
+			return "", err
+		}
+		instructions = append(instructions, closeAccInst)
+	} else if outputMint.Equals(WSOL) {
+		closeAccInst, err := token.NewCloseAccountInstruction(
+			outputAta,
+			signer.PublicKey(),
+			signer.PublicKey(),
+			[]solana.PublicKey{},
+		).ValidateAndBuild()
+
+		if err != nil {
+			return "", err
+		}
+		instructions = append(instructions, closeAccInst)
+	}
+
 	blockhash, err := client.GetLatestBlockhash(context.Background(), rpc.CommitmentFinalized)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch recent blockhash: %w", err)
 	}
 	tx, err := solana.NewTransaction(
-		swapInstructionsFrom(computeUnitLimit, inputAtaCreateInstruction, outputAtaCreateInstruction, swapInstruction),
+		swapInstructionsFrom(computeUnitLimit, priorityFee, instructions),
 		blockhash.Value.Blockhash,
 		solana.TransactionPayer(payerPubKey),
 	)
@@ -188,22 +262,20 @@ func baseOutDataFrom(maxAmountIn uint64, amountOut uint64) ([]byte, error) {
 
 func swapInstructionsFrom(
 	computeUnitLimit uint32,
-	inputAtaCreateInstruction *associatedtokenaccount.Instruction,
-	outputAtaCreateInstruction *associatedtokenaccount.Instruction,
-	swapInstruction *solana.GenericInstruction,
+	priorityFee uint64,
+	insts []solana.Instruction,
 ) []solana.Instruction {
 	computeUnitLimitInstruction := computebudget.NewSetComputeUnitLimitInstruction(
 		computeUnitLimit,
 	).Build()
+	computeUnitPriceInstruction := computebudget.NewSetComputeUnitPriceInstruction(
+		priorityFee,
+	).Build()
 
-	instructions := []solana.Instruction{computeUnitLimitInstruction}
-	if inputAtaCreateInstruction != nil {
-		instructions = append(instructions, inputAtaCreateInstruction)
+	instructions := []solana.Instruction{computeUnitLimitInstruction, computeUnitPriceInstruction}
+	for _, inst := range insts {
+		instructions = append(instructions, inst)
 	}
-	if outputAtaCreateInstruction != nil {
-		instructions = append(instructions, outputAtaCreateInstruction)
-	}
-	instructions = append(instructions, swapInstruction)
 	return instructions
 }
 
@@ -227,24 +299,24 @@ func swapAccountsFrom(
 	payer solana.PublicKey,
 ) []*solana.AccountMeta {
 	return []*solana.AccountMeta{
-		solana.NewAccountMeta(SYSTEM_TOKEN_PROGRAM, false, false), // TOKEN PROGRAM
-		solana.NewAccountMeta(pool, true, false),                  // AMM
-		solana.NewAccountMeta(ammAuthority, false, false),         // AMM Authority
-		solana.NewAccountMeta(openOrders, true, false),            // Amm Open Orders
-		solana.NewAccountMeta(targetOrders, true, false),          // Amm Target Orders
-		solana.NewAccountMeta(coinVault, true, false),             // Pool Coin Token Account
-		solana.NewAccountMeta(pcVault, true, false),               // Pool Pc Token Account
-		solana.NewAccountMeta(marketProgram, false, false),        // Serum PROGRAM
-		solana.NewAccountMeta(market, true, false),                // Serum Market
-		solana.NewAccountMeta(bids, true, false),                  // Serum Bids
-		solana.NewAccountMeta(asks, true, false),                  // Serum Asks
-		solana.NewAccountMeta(eventQueue, true, false),            // Serum Event Queue
-		solana.NewAccountMeta(baseVault, true, false),             // Serum Coin Vault Account
-		solana.NewAccountMeta(quoteVault, true, false),            // Serum Pc Vault Account
-		solana.NewAccountMeta(vaultSigner, false, false),          // Serum Vault Signer
-		solana.NewAccountMeta(inputMint, true, false),             // User Source Token Account
-		solana.NewAccountMeta(outputMint, true, false),            // User Destination Token Account
-		solana.NewAccountMeta(payer, true, true),                  // User Source Owner
+		solana.NewAccountMeta(token.ProgramID, false, false), // TOKEN PROGRAM
+		solana.NewAccountMeta(pool, true, false),             // AMM
+		solana.NewAccountMeta(ammAuthority, false, false),    // AMM Authority
+		solana.NewAccountMeta(openOrders, true, false),       // Amm Open Orders
+		solana.NewAccountMeta(targetOrders, true, false),     // Amm Target Orders
+		solana.NewAccountMeta(coinVault, true, false),        // Pool Coin Token Account
+		solana.NewAccountMeta(pcVault, true, false),          // Pool Pc Token Account
+		solana.NewAccountMeta(marketProgram, false, false),   // Serum PROGRAM
+		solana.NewAccountMeta(market, true, false),           // Serum Market
+		solana.NewAccountMeta(bids, true, false),             // Serum Bids
+		solana.NewAccountMeta(asks, true, false),             // Serum Asks
+		solana.NewAccountMeta(eventQueue, true, false),       // Serum Event Queue
+		solana.NewAccountMeta(baseVault, true, false),        // Serum Coin Vault Account
+		solana.NewAccountMeta(quoteVault, true, false),       // Serum Pc Vault Account
+		solana.NewAccountMeta(vaultSigner, false, false),     // Serum Vault Signer
+		solana.NewAccountMeta(inputMint, true, false),        // User Source Token Account
+		solana.NewAccountMeta(outputMint, true, false),       // User Destination Token Account
+		solana.NewAccountMeta(payer, true, true),             // User Source Owner
 	}
 }
 
@@ -274,9 +346,49 @@ func int8ToBuf(value uint8) []byte {
 	return buf.Bytes()
 }
 
-func getOrCreateTokenAccountInstruction(client *rpc.Client, tokenMintPubKey solana.PublicKey, ownerPrivateKey solana.PrivateKey) (solana.PublicKey, *associatedtokenaccount.Instruction, error) {
+func getOrCreateTokenAccountInstruction(client *rpc.Client, tokenMintPubKey solana.PublicKey, ownerPrivateKey solana.PrivateKey, amountSpecified uint64, input bool) (solana.PublicKey, []solana.Instruction, error) {
+	var res []solana.Instruction
 	owner := ownerPrivateKey.PublicKey()
 
+	if tokenMintPubKey.Equals(WSOL) {
+		accountLamport, err := client.GetMinimumBalanceForRentExemption(context.Background(), dataSize, rpc.CommitmentConfirmed)
+		if err != nil {
+			return solana.PublicKey{}, res, err
+		}
+		if input {
+			accountLamport += amountSpecified
+		}
+		seed := solana.NewWallet().PublicKey().String()[0:32]
+		publicKey, err := solana.CreateWithSeed(owner, seed, token.ProgramID)
+		if err != nil {
+			return solana.PublicKey{}, res, err
+		}
+
+		createInst, err := system.NewCreateAccountWithSeedInstruction(
+			owner,
+			seed,
+			accountLamport,
+			dataSize,
+			token.ProgramID,
+			owner,
+			publicKey,
+			owner,
+		).ValidateAndBuild()
+
+		if err != nil {
+			return solana.PublicKey{}, res, err
+		}
+		res = append(res, createInst)
+
+		initInst, err := token.NewInitializeAccountInstruction(
+			publicKey,
+			WSOL,
+			owner,
+			solana.SysVarRentPubkey,
+		).ValidateAndBuild()
+		res = append(res, initInst)
+		return publicKey, res, nil
+	}
 	// Find the associated token account address
 	ata, _, err := solana.FindAssociatedTokenAddress(owner, tokenMintPubKey)
 	if err != nil {
@@ -295,8 +407,8 @@ func getOrCreateTokenAccountInstruction(client *rpc.Client, tokenMintPubKey sola
 		owner,           // wallet owner
 		tokenMintPubKey, // token mint
 	).Build()
-
-	return ata, createATAIx, nil
+	res = append(res, createATAIx)
+	return ata, res, nil
 }
 
 // Fees 对应 Rust 中的 Fees
@@ -403,4 +515,42 @@ func GetMarketState(client *rpc.Client, market solana.PublicKey) (MarketState, e
 	var state MarketState
 	err := client.GetAccountDataInto(context.Background(), market, &state)
 	return state, err
+}
+
+func ParseRayLog(msg string) (interface{}, error) {
+	// 去掉前缀
+	base64Part := msg
+	if len(msg) > 9 && msg[:9] == "ray_log: " {
+		base64Part = msg[9:]
+	}
+
+	// 解码
+	data, err := base64.StdEncoding.DecodeString(base64Part)
+	if err != nil {
+		return nil, fmt.Errorf("base64 decode failed: %w", err)
+	}
+
+	if len(data) < 1 {
+		return nil, fmt.Errorf("invalid log: no data")
+	}
+
+	logType := data[0]
+	reader := bytes.NewReader(data)
+
+	switch logType {
+	case LogSwapBaseIn:
+		var log SwapBaseInLog
+		if err := binary.Read(reader, binary.LittleEndian, &log); err != nil {
+			return nil, err
+		}
+		return log, nil
+	case LogSwapBaseOut:
+		var log SwapBaseOutLog
+		if err := binary.Read(reader, binary.LittleEndian, &log); err != nil {
+			return nil, err
+		}
+		return log, nil
+	default:
+		return nil, fmt.Errorf("unsupported log type: %d", logType)
+	}
 }

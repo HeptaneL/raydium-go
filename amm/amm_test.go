@@ -85,3 +85,13 @@ func TestGetAssociatedAuthority(t *testing.T) {
 	t.Log(signer)
 	t.Log(nonce)
 }
+
+func TestParseRayLog(t *testing.T) {
+	msg := "ray_log: A0BCDwAAAAAAS8elcVACAAABAAAAAAAAAEBCDwAAAAAAziWk9e+IKAK1TovGDAAAAHDdYkWSAgAA"
+	resp, err := ParseRayLog(msg)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	t.Log(resp)
+}
